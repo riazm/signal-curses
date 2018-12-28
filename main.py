@@ -187,9 +187,10 @@ class MessagesLine(npyscreen.MultiLine):
         self.values = []
 
     def addDatedValues(self, values):
+        log('adingdatedvalues', values)
         self._real_values += values
-
-        #self.update()
+        log(self._real_values)
+        self.update()
 
     def _mark_value_as(self, value, txt):
         log('mark: ', value, 'as: ', txt)
@@ -464,10 +465,13 @@ class SignalApp(npyscreen.StandardApp):
                 self.addLine(line)
 
     def addEnvelope(self, env):
+        log('adding envelope', env)
         gen_line = env.gen_line()
+        log('gennedline')
         self.app.wMain.addDatedValues([
             gen_line
         ])
+        log('finishedadding')
 
     def markAsEnvelope(self, env, suffix):
         log('markAsEnvelope:', env, suffix)
@@ -526,6 +530,14 @@ class SignalApp(npyscreen.StandardApp):
         #self.parent.wMain.addValues([
         #    (self._getSelfName(), val)])
 
+    def handleDbusLine(self, data):
+        log('handling dbus line')
+        try:
+            env = Envelope.load(data, self, Envelope.NETWORK)
+        except Exception as e:
+            log("error", e)
+        self.handleEnvelope(env)
+        
     def handleDaemonLine(self, line):
         self.raw_lines.append(line)
         log('handleDaemonLine', line)
@@ -534,6 +546,7 @@ class SignalApp(npyscreen.StandardApp):
         self.handleEnvelope(env)
 
     def handleEnvelope(self, env):
+        log('handling envelope', env)
         self.envelopes.append(env)
 
         if env.timestamp and (time.time() - env.epoch_ts) >= 60:
@@ -541,6 +554,7 @@ class SignalApp(npyscreen.StandardApp):
             return
 
         if env.dataMessage.is_message():
+            log('ismessage')
             if self.state.shouldDisplayEnvelope(env):
                 self.addEnvelope(env)
             elif self.state.shouldNotifyEnvelope(env):
@@ -561,23 +575,26 @@ class SignalApp(npyscreen.StandardApp):
                     self.markAsEnvelope(e, '(read)')
 
         if env.callMessage.is_offer():
+            log('iscall')
             self.app.wMain.addValues([
                 ('*', 'You are receiving an inbound call from {}'.format(env.source))
             ])
             npyscreen.notify_wait('You are receiving an inbound call', title='Call from {}'.format(env.source))
 
         if env.callMessage.is_busy():
+            log('ismessage busy')
             self.app.wMain.addValues([
                 ('*', 'The caller {} is busy'.format(env.source))
             ])
             npyscreen.notify_wait('The caller is busy', title='Call from {}'.format(env.source))
 
         if env.callMessage.is_hangup():
+            log('hangup')
             self.app.wMain.addValues([
                 ('*', 'The caller {} hung up'.format(env.source))
             ])
             npyscreen.notify_wait('The caller hung up', title='Call from {}'.format(env.source))
-
+        log('dropped through!')
 
     def handleMessageLine(self, line):
         self.messageLines.append(line)
@@ -647,6 +664,7 @@ class Envelope(object):
         return str(datetime.fromtimestamp(self.epoch_ts))[:19]
 
     def gen_line(self):
+        log('gennneritangline')
         if self.sourceName:
             return (self.format_ts(), '{} ({})'.format(self.sourceName, self.source), self.dataMessage.gen_line())
         return (self.format_ts(), '{}'.format(self.source), self.dataMessage.gen_line())
@@ -754,33 +772,51 @@ class CallMessage(object):
 class SignalDaemonThread(threading.Thread):
     daemon = False
     app = None
+    signal = None
+    bus = None
+    
     def __init__(self, app):
         super(SignalDaemonThread, self).__init__()
         self.app = app
 
+    def get_message_bus(self):
+        return self.bus.get('org.asamk.Signal')
+
+    def msgRcv(self, timestamp, source, groupID, message, attachments):
+        log ('what', timestamp, source, message)
+        data = {"envelope":{ "timestamp" : timestamp,
+                 "source" : source,
+                 "dataMessage": {
+                     "timestamp": timestamp,
+                     "message": message
+                }
+        }}
+        self.app.handleDbusLine(data)
+    
     def run(self):
         log('daemon thread')
 
         state = self.app.state
-        script = ['signal-cli', '-u', state.phone, 'daemon', '--json']
-        #script = ['python3', 'sp.py']
-        try:
-            popen = execute_popen(script)
-            self.app.daemonPopen = popen
-            log('daemon popen')
-            for line in execute(popen):
-                #log('queue event')
-                out_file_lock.acquire()
-                out_file.write(line)
-                out_file.flush()
-                out_file_lock.release()
-                log('line:', line)
-                self.app.handleDaemonLine(line)
-                self.app.queue_event(npyscreen.Event("RELOAD"))
-        except subprocess.CalledProcessError as e:
-            if not self.app.isShuttingDown:
-                log('EXCEPTION in daemon', e)
-        log('daemon exit')
+        
+        if self.app.state.bus == 'system':
+            self.bus = pydbus.SystemBus()
+        else:
+            self.bus = pydbus.SessionBus()
+
+        log('daemon waiting for ({}) dbus...'.format(self.app.state.bus))
+        self.signal = exception_waitloop(self.get_message_bus, GLib.Error, 60)
+        log('qkuam')
+        if not self.signal:
+            log('dbus err')
+            npyscreen.notify_wait('Unable to get signal {} bus. Messaging functionality will not function.'.format(self.app.state.bus), title='Error in SignalDaemonThread')
+            exit(1)
+        log('got daemon dbus')
+        msgRcv = lambda timestamp, source, groupID, message, attachments : self.msgRcv(timestamp, source, groupID, message, attachments)
+
+        loop = GLib.MainLoop()
+        self.signal.onMessageReceived = msgRcv
+        log('daemon starting loop')
+        loop.run()
 
 class SignalMessageThread(threading.Thread):
     app = None
@@ -804,15 +840,14 @@ class SignalMessageThread(threading.Thread):
         else:
             self.bus = pydbus.SessionBus()
 
-        log('waiting for ({}) dbus...'.format(self.app.state.bus))
+        log('message waiting for ({}) dbus...'.format(self.app.state.bus))
         self.signal = exception_waitloop(self.get_message_bus, GLib.Error, 60)
         if not self.signal:
             log('dbus err')
-            npyscreen.notify_wait('Unable to get signal {} bus. Messaging functionality will not function.'.format(self.app.state.bus), title='Error in SignalDaemonThread')
+            npyscreen.notify_wait('Unable to get signal {} bus. Messaging functionality will not function.'.format(self.app.state.bus), title='Error in SignalMessageThread')
             exit(1)
-        log('got dbus')
-        # self.signal.onMessageReceived
-
+        log('got message dbus')
+        
         while True:
             item = self.queue.get()
             log('queue item', item)
