@@ -107,6 +107,7 @@ class MessagesLine(npyscreen.MultiLine):
     _size_max = 30
     _date_size = 20
     _real_values = []
+    _saved_lines = {}
     def __init__(self, *args, **kwargs):
         #kwargs['columns'] = 6
         #kwargs['column_width'] = 20
@@ -187,9 +188,18 @@ class MessagesLine(npyscreen.MultiLine):
         self.values = []
 
     def addDatedValues(self, values):
-        log('adingdatedvalues', values)
+        numRegex = re.compile(".* \(([\+0-9]*)\)")
+        log('values is', values)
+        for entry in values:
+            log('adding dated value to saved_lines ', entry)
+            source = numRegex.match(entry[1]).group(1)
+            # need to add dated values under source if from other
+            # under other end if from self
+            log('logging as:', source)
+            if (source not in self._saved_lines.keys()):
+                self._saved_lines[source] = []
+            self._saved_lines[source].append(entry)
         self._real_values += values
-        log(self._real_values)
         self.update()
 
     def _mark_value_as(self, value, txt):
@@ -429,6 +439,7 @@ class SignalApp(npyscreen.StandardApp):
     raw_lines = []
     messageLines = []
     state = None
+    stateNumber = None
     isShuttingDown = False
     lines = []
     envelopes = []
@@ -454,24 +465,53 @@ class SignalApp(npyscreen.StandardApp):
 
     def updateState(self, selected, is_group):
         self.state.load(selected, is_group)
-        log('new state:', self.state)
+        log('new state:', self.state, "selected:", selected)
+        self.stateNumber = selected['number']
+        self.lines = []
+        try:
+            self.loadDisplayLines()
+        except Exception as e:
+            log('error loading lines', e)
+        # add number of state to switch to
 
-        self.loadDisplayLines()
         self.app.updateState()
 
     def loadDisplayLines(self):
-        for line in self.lines:
-            if self.state.shouldDisplayLine(line):
-                self.addLine(line)
+        log('disaplaying lines', self.lines)
+        #self.app.wMain.addDatedValues(self.lines)
+        log('_key', self.stateNumber)
+        log('_savedlineskeys:',self.app.wMain._saved_lines.keys())
+        # load previous lines
+        try:
+#            self.app.wMain.addDatedValues(self.app.wMain._saved_lines[self.stateNumber])
+            log('trying to load prev lines')
+            for line in self.app.wMain._saved_lines[self.stateNumber]:
+                log('loaded line:', line)
+                if (line):
+                    self.lines.append(line)
+                    log('added to lines', self.lines)
+            log('erasing lines: ', self.app.wMain._saved_lines[self.stateNumber])
+            self.app.wMain._saved_lines[self.stateNumber] = []
+        except Exception as e:
+            log('broken', e)
+        self.app.wMain.addDatedValues(self.lines)
+        # for line in self.lines:
+        #     if self.state.shouldDisplayLine(line):
+        #         self.addLine(line)
 
+    def addHiddenEnvelope(self, env):
+        log('adding hidden envelope', env)
+        log('source:', env.source)
+        if (env.source not in self.app.wMain._saved_lines.keys()):
+                self.app.wMain._saved_lines[env.source] = []
+        self.app.wMain._saved_lines[env.source].append(env.gen_line())
+    
     def addEnvelope(self, env):
         log('adding envelope', env)
         gen_line = env.gen_line()
-        log('gennedline')
         self.app.wMain.addDatedValues([
             gen_line
         ])
-        log('finishedadding')
 
     def markAsEnvelope(self, env, suffix):
         log('markAsEnvelope:', env, suffix)
@@ -496,7 +536,10 @@ class SignalApp(npyscreen.StandardApp):
         })
 
     def killDaemon(self):
-        self.daemonPopen.send_signal(SIGINT)
+        try:
+            self.daemonPopen.send_signal(SIGINT)
+        except Exception as e:
+            log('couldnt kill daemon')
 
     def handleExit(self):
         self.isShuttingDown = True
@@ -546,7 +589,6 @@ class SignalApp(npyscreen.StandardApp):
         self.handleEnvelope(env)
 
     def handleEnvelope(self, env):
-        log('handling envelope', env)
         self.envelopes.append(env)
 
         if env.timestamp and (time.time() - env.epoch_ts) >= 60:
@@ -554,10 +596,11 @@ class SignalApp(npyscreen.StandardApp):
             return
 
         if env.dataMessage.is_message():
-            log('ismessage')
             if self.state.shouldDisplayEnvelope(env):
                 self.addEnvelope(env)
             elif self.state.shouldNotifyEnvelope(env):
+                log('adding hidden line')
+                self.addHiddenEnvelope(env)
                 log('notifying line')
                 gen_line = env.gen_line()
                 txt = '{}:\n\n{}'.format(gen_line[0], gen_line[2])
@@ -568,14 +611,12 @@ class SignalApp(npyscreen.StandardApp):
                 log('not displaying or notifying dataMessage')
 
         if env.syncMessage.is_read_message():
-            log('is read message', env.syncMessage)
             for e in self.envelopes[:-1]:
                 if env.syncMessage.sync_read_matches(e):
                     log('mark_read', e)
                     self.markAsEnvelope(e, '(read)')
 
         if env.callMessage.is_offer():
-            log('iscall')
             self.app.wMain.addValues([
                 ('*', 'You are receiving an inbound call from {}'.format(env.source))
             ])
@@ -594,11 +635,9 @@ class SignalApp(npyscreen.StandardApp):
                 ('*', 'The caller {} hung up'.format(env.source))
             ])
             npyscreen.notify_wait('The caller hung up', title='Call from {}'.format(env.source))
-        log('dropped through!')
 
     def handleMessageLine(self, line):
         self.messageLines.append(line)
-        log('handleMessageLine', line)
 
 class Envelope(object):
     app = None
@@ -638,7 +677,6 @@ class Envelope(object):
 
     def should_notify(self, toNumber, phone):
         # fromNumber != phone
-        log('should_notify', toNumber, phone, self.source, self.dataMessage.should_display())
         return (self.source != toNumber) and (self.source != phone) and self.dataMessage.should_notify()
 
     def lookup_number(self, number):
@@ -664,7 +702,6 @@ class Envelope(object):
         return str(datetime.fromtimestamp(self.epoch_ts))[:19]
 
     def gen_line(self):
-        log('gennneritangline')
         if self.sourceName:
             return (self.format_ts(), '{} ({})'.format(self.sourceName, self.source), self.dataMessage.gen_line())
         return (self.format_ts(), '{}'.format(self.source), self.dataMessage.gen_line())
@@ -768,7 +805,6 @@ class CallMessage(object):
     def is_hangup(self):
         return self.hangupMessage
 
-
 class SignalDaemonThread(threading.Thread):
     daemon = False
     app = None
@@ -783,7 +819,7 @@ class SignalDaemonThread(threading.Thread):
         return self.bus.get('org.asamk.Signal')
 
     def msgRcv(self, timestamp, source, groupID, message, attachments):
-        log ('what', timestamp, source, message)
+        log ('dbus recvd', timestamp, source, message, groupID, message)
         data = {"envelope":{ "timestamp" : timestamp,
                  "source" : source,
                  "dataMessage": {
@@ -805,7 +841,6 @@ class SignalDaemonThread(threading.Thread):
 
         log('daemon waiting for ({}) dbus...'.format(self.app.state.bus))
         self.signal = exception_waitloop(self.get_message_bus, GLib.Error, 60)
-        log('qkuam')
         if not self.signal:
             log('dbus err')
             npyscreen.notify_wait('Unable to get signal {} bus. Messaging functionality will not function.'.format(self.app.state.bus), title='Error in SignalDaemonThread')
